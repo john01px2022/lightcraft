@@ -1537,10 +1537,15 @@ pub fn civil(secs: i64) -> String {
 /// in UTC, which put an evening photo on the next day).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn local_civil(secs: i64) -> String {
-    // The zone is read once: it holds the whole rule set, so each instant still gets the offset
-    // that was in force then, and an import does not re-read the system database per file.
+    civil_in(secs, system_zone())
+}
+
+/// The host's zone, read once: it holds the whole rule set, so each instant still gets the offset
+/// that was in force then, and an import does not re-read the system database per file.
+#[cfg(not(target_arch = "wasm32"))]
+fn system_zone() -> &'static jiff::tz::TimeZone {
     static ZONE: std::sync::OnceLock<jiff::tz::TimeZone> = std::sync::OnceLock::new();
-    civil_in(secs, ZONE.get_or_init(jiff::tz::TimeZone::system))
+    ZONE.get_or_init(jiff::tz::TimeZone::system)
 }
 
 /// [`local_civil`] in a given zone. `jiff::TimeZone::system` falls back to a zone that behaves
@@ -1558,13 +1563,26 @@ pub fn local_civil(secs: i64) -> String {
 }
 
 /// The instant at which the host's zone reads `civil` (`YYYY-MM-DDTHH:MM:SS`): the inverse of
-/// [`local_civil`]. `None` when the text is not a civil date-time, or when the host's zone has no
-/// such moment (the hour a spring-forward skips). Tests pin a file's modification time with it, so
-/// that an undated file takes the local date they mean whatever zone the machine is in.
+/// [`local_civil`]. Tests pin a file's modification time with it, so that an undated file takes
+/// the local date they mean whatever zone the machine is in.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn local_instant(civil: &str) -> Option<i64> {
+    instant_in(civil, system_zone())
+}
+
+/// [`local_instant`] in a given zone. `None` when the text is not a civil date-time, or when the
+/// zone has no such moment: an hour a spring-forward removes is not a time anything happened at,
+/// and jiff's ordinary conversion would answer with the instant an hour later, which reads back as
+/// a different time and so is not an inverse at all. An hour a fall-back repeats takes the first
+/// of the two.
+#[cfg(not(target_arch = "wasm32"))]
+fn instant_in(civil: &str, zone: &jiff::tz::TimeZone) -> Option<i64> {
     let when: jiff::civil::DateTime = civil.trim().parse().ok()?;
-    when.to_zoned(jiff::tz::TimeZone::system()).ok().map(|z| z.timestamp().as_second())
+    let ambiguous = zone.to_ambiguous_zoned(when);
+    match ambiguous.offset() {
+        jiff::tz::AmbiguousOffset::Gap { .. } => None,
+        _ => ambiguous.earlier().ok().map(|z| z.timestamp().as_second()),
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1668,6 +1686,29 @@ mod clock_tests {
             assert_eq!(local_civil(secs), iso);
         }
         assert_eq!(local_instant("not a date"), None);
+    }
+
+    /// The hour a spring-forward removes is no instant at all, so there is nothing to answer with:
+    /// jiff's ordinary conversion returns the hour after the gap, which would pin a file to a time
+    /// it does not read back as. The hour a fall-back repeats takes the first of the two.
+    #[test]
+    fn a_local_time_a_spring_forward_removed_has_no_instant() {
+        let Ok(zone) = jiff::tz::TimeZone::get("America/New_York") else {
+            lightcraft_testkit::skip!(System, "no IANA time zone database to read America/New_York from");
+            return;
+        };
+        // 2026-03-08: 02:00 becomes 03:00, so nothing happened at 02:30
+        assert_eq!(instant_in("2026-03-08T02:30:00", &zone), None);
+        // the hours either side of the gap are ordinary, and round-trip
+        for iso in ["2026-03-08T01:30:00", "2026-03-08T03:30:00"] {
+            let secs = instant_in(iso, &zone).expect("either side of the gap");
+            assert_eq!(civil_in(secs, &zone), iso);
+        }
+        // 2026-11-01: 02:00 becomes 01:00, so 01:30 happens twice; the first is the one in summer
+        // time, 05:30 UTC, and it reads back as what was asked for
+        let fold = instant_in("2026-11-01T01:30:00", &zone).expect("the repeated hour");
+        assert_eq!(fold, lightcraft_meta::DateTime::parse_iso("2026-11-01T05:30:00Z").expect("a test timestamp").unix_seconds());
+        assert_eq!(civil_in(fold, &zone), "2026-11-01T01:30:00");
     }
 
     /// Whatever the host's zone, what it produces is a date the rest of the catalog can read back,
