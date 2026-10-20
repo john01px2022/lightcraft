@@ -1515,7 +1515,7 @@ pub fn system_clock() -> String {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        civil(secs)
+        local_civil(secs)
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -1526,6 +1526,50 @@ pub fn system_clock() -> String {
 /// Unix seconds → `YYYY-MM-DDTHH:MM:SS` (UTC), proleptic Gregorian.
 pub fn civil(secs: i64) -> String {
     lightcraft_catalog::dates::civil(secs)
+}
+
+/// Unix seconds → `YYYY-MM-DDTHH:MM:SS` in the host's time zone: the local civil time every date
+/// the catalog stores is in (`captured`, `imported`, an album's `created`, an edit's `edited`).
+///
+/// The offset is the one in force *at that instant*, not today's, so a photo from July keeps
+/// summer time when it is read in January. A host whose zone cannot be read falls back to UTC, as
+/// the web build does (issue #2284: a file with no capture date was dated by its modification time
+/// in UTC, which put an evening photo on the next day).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn local_civil(secs: i64) -> String {
+    // The zone is read once: it holds the whole rule set, so each instant still gets the offset
+    // that was in force then, and an import does not re-read the system database per file.
+    static ZONE: std::sync::OnceLock<jiff::tz::TimeZone> = std::sync::OnceLock::new();
+    civil_in(secs, ZONE.get_or_init(jiff::tz::TimeZone::system))
+}
+
+/// [`local_civil`] in a given zone. `jiff::TimeZone::system` falls back to a zone that behaves
+/// like UTC when the host has none to read, and an instant outside the range it can represent
+/// (far outside the range of a file date) keeps its UTC reading rather than failing an import.
+#[cfg(not(target_arch = "wasm32"))]
+fn civil_in(secs: i64, zone: &jiff::tz::TimeZone) -> String {
+    let offset = jiff::Timestamp::from_second(secs).map(|t| i64::from(zone.to_offset_info(t).offset().seconds())).unwrap_or(0);
+    civil(secs.saturating_add(offset))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn local_civil(secs: i64) -> String {
+    civil(secs)
+}
+
+/// The instant at which the host's zone reads `civil` (`YYYY-MM-DDTHH:MM:SS`): the inverse of
+/// [`local_civil`]. `None` when the text is not a civil date-time, or when the host's zone has no
+/// such moment (the hour a spring-forward skips). Tests pin a file's modification time with it, so
+/// that an undated file takes the local date they mean whatever zone the machine is in.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn local_instant(civil: &str) -> Option<i64> {
+    let when: jiff::civil::DateTime = civil.trim().parse().ok()?;
+    when.to_zoned(jiff::tz::TimeZone::system()).ok().map(|z| z.timestamp().as_second())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn local_instant(civil: &str) -> Option<i64> {
+    lightcraft_catalog::dates::iso_seconds(civil)
 }
 
 impl Session {
@@ -1584,6 +1628,61 @@ impl Session {
 #[cfg(test)]
 #[path = "import/tests_known.rs"]
 mod tests_known;
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    /// Issue #2284: an instant becomes the civil time the host's own zone shows for it, with the
+    /// offset in force *then*. The reported case is a JPEG with no capture date whose modification
+    /// time is 2026-10-18 20:15:11 in UTC-5: dated by `civil` it read 01:15 the next day.
+    #[test]
+    fn local_civil_reads_the_hosts_zone_at_that_instant() {
+        let zone = jiff::tz::TimeZone::system();
+        // the report, then one in each half of the year (so a zone with DST uses both offsets),
+        // one on a year boundary, and one before the epoch
+        for iso in ["2026-10-19T01:15:11Z", "2026-07-04T12:00:00Z", "2026-01-15T23:30:00Z", "2027-01-01T00:00:00Z", "1969-12-31T23:59:59Z"] {
+            let secs = lightcraft_meta::DateTime::parse_iso(iso).expect("a test timestamp").unix_seconds();
+            let zoned = jiff::Timestamp::from_second(secs).expect("in range").to_zoned(zone.clone());
+            assert_eq!(local_civil(secs), zoned.strftime("%Y-%m-%dT%H:%M:%S").to_string(), "{iso}");
+        }
+    }
+
+    /// The reported numbers, against a fixed UTC-5 zone, so they are checked on any host: a CI
+    /// runner set to UTC would make the test above agree with itself and prove nothing.
+    #[test]
+    fn an_evening_in_utc_minus_5_stays_that_evening() {
+        let secs = lightcraft_meta::DateTime::parse_iso("2026-10-19T01:15:11Z").expect("a test timestamp").unix_seconds();
+        assert_eq!(civil(secs), "2026-10-19T01:15:11", "the UTC reading the file used to be dated by");
+        let zone = jiff::tz::TimeZone::fixed(jiff::tz::offset(-5));
+        assert_eq!(civil_in(secs, &zone), "2026-10-18T20:15:11");
+        // and the other way, so the sign cannot be read backwards
+        assert_eq!(civil_in(secs, &jiff::tz::TimeZone::fixed(jiff::tz::offset(2))), "2026-10-19T03:15:11");
+    }
+
+    /// `local_instant` undoes `local_civil`, so a fixture can pin a file to a local date.
+    #[test]
+    fn local_instant_is_the_inverse_of_local_civil() {
+        for iso in ["2026-01-14T05:58:48", "2026-07-04T12:00:00", "2026-10-18T20:15:11"] {
+            let secs = local_instant(iso).expect("a local instant");
+            assert_eq!(local_civil(secs), iso);
+        }
+        assert_eq!(local_instant("not a date"), None);
+    }
+
+    /// Whatever the host's zone, what it produces is a date the rest of the catalog can read back,
+    /// and it differs from UTC only by a whole number of minutes no larger than a real offset.
+    #[test]
+    fn local_civil_is_a_catalog_date_within_a_real_offset_of_utc() {
+        let secs = lightcraft_meta::DateTime::parse_iso("2026-10-19T01:15:11Z").expect("a test timestamp").unix_seconds();
+        let local = local_civil(secs);
+        let read = lightcraft_catalog::dates::iso_seconds(&local).expect("a date the catalog can read");
+        let shift = read - secs;
+        assert_eq!(shift % 60, 0, "{local}");
+        assert!(shift.abs() <= 18 * 3600, "{local}");
+        assert_eq!(lightcraft_catalog::dates::normalize_iso(&local).as_deref(), Some(local.as_str()));
+    }
+}
 
 #[cfg(test)]
 mod prepared_tests {
